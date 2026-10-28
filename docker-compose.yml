@@ -1,0 +1,164 @@
+# DiffStyle3D on Docker.
+#
+#   cp .env.example .env            # set host paths / scene / style image
+#   docker compose build
+#   docker compose run --rm download-sd   # 0. fetch Stable Diffusion v1.5 (once)
+#   docker compose run --rm prepare-scene # (if view sizes differ) RAW_SCENE -> SCENE
+#   docker compose run --rm train-3dgs    # 1. reconstruct the scene with 3DGS
+#   docker compose run --rm train-style   # 2. stylize it with DiffStyle3D
+#   docker compose up tensorboard         # (optional) http://localhost:6006
+#
+# Paths and private values live in .env; every training config lives here and is
+# passed to the scripts through the environment (see docker/*.sh).
+# Extra CLI arguments are appended, e.g. `docker compose run --rm train-style --quiet`.
+
+name: diffstyle3d
+
+# Iteration whose checkpoint train-3dgs writes and train-style starts from.
+x-gs-iterations: &gs-iterations "30000"
+
+# Local Stable Diffusion directory written by download-sd and read by train-style.
+x-sd-local-dir: &sd-local-dir /models/stable-diffusion-v1-5
+
+x-base: &base
+  image: diffstyle3d:cu121
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+    args:
+      TORCH_CUDA_ARCH_LIST: "8.9"   # RTX 4090 (sm_89). e.g. "8.6;8.9" to target more GPUs.
+      MAX_JOBS: "2"                 # nvcc build parallelism; raise if RAM allows.
+  user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+  working_dir: /workspace
+  ipc: host
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+  volumes:
+    - .:/workspace
+    - ${DATA_DIR:?set DATA_DIR in .env}:/data   # writable: 3DGS writes sparse/0/points3D.ply on first load
+    - ${GS_OUTPUT_DIR:?set GS_OUTPUT_DIR in .env}:/gs_output
+    - ${STYLE_OUTPUT_DIR:?set STYLE_OUTPUT_DIR in .env}:/style_output
+    - ${STYLE_DIR:?set STYLE_DIR in .env}:/styles:ro
+    - ${MODELS_DIR:?set MODELS_DIR in .env}:/models
+    - ${HF_CACHE_DIR:?set HF_CACHE_DIR in .env}:/cache/huggingface
+
+x-base-env: &base-env
+  HOME: /tmp
+  HF_HOME: /cache/huggingface
+  HF_TOKEN: ${HF_TOKEN:-}
+  NVIDIA_DRIVER_CAPABILITIES: compute,utility
+  # Viewer (network_gui) is off by default. To use it, set DISABLE_VIEWER to "false"
+  # and run with `docker compose run --rm --service-ports <service>`.
+  DISABLE_VIEWER: "true"
+  VIEWER_IP: 0.0.0.0
+  # Background color of train-3dgs and train-style ("true": white, "false": black).
+  # Keep it the same for both: re-run train-3dgs after changing it.
+  WHITE_BACKGROUND: "true"
+
+services:
+  # Step 0: download Stable Diffusion into MODELS_DIR (no GPU needed).
+  download-sd:
+    <<: *base
+    deploy: {}
+    entrypoint: ["bash", "/workspace/docker/download_sd.sh"]
+    command: []
+    environment:
+      <<: *base-env
+      SD_REPO_ID: stable-diffusion-v1-5/stable-diffusion-v1-5
+      SD_LOCAL_DIR: *sd-local-dir
+
+  # Optional step: resize all views of RAW_SCENE to one resolution and write it as SCENE.
+  # train_style.py needs every view to have the same size; COLMAP-undistorted
+  # scenes usually have a slightly different size per camera.
+  prepare-scene:
+    <<: *base
+    deploy: {}
+    entrypoint: ["bash", "/workspace/docker/prepare_scene.sh"]
+    command: []
+    environment:
+      <<: *base-env
+      RAW_SCENE: ${RAW_SCENE:-}
+      SOURCE_PATH: /data/${SCENE:?set SCENE in .env}
+      # Views are resized to 512x512 before Stable Diffusion anyway; keep the
+      # aspect ratio close to the source images (here portrait 9:16).
+      TARGET_WIDTH: "576"
+      TARGET_HEIGHT: "1024"
+
+  # Step 1: 3D Gaussian Splatting reconstruction (graphdeco-inria/gaussian-splatting train.py).
+  train-3dgs:
+    <<: *base
+    entrypoint: ["bash", "/workspace/docker/train_3dgs.sh"]
+    command: []
+    ports:
+      - "6009:6009"
+    environment:
+      <<: *base-env
+      SOURCE_PATH: /data/${SCENE:?set SCENE in .env}
+      MODEL_PATH: /gs_output/${SCENE}
+      ITERATIONS: *gs-iterations
+      RESOLUTION: "1"       # -1: auto (downscale to <=1.6K width), 1/2/4/8: fixed downscale
+      EVAL: "false"         # hold out every 8th view as test set
+      VIEWER_PORT: "6009"
+
+  # Step 2: DiffStyle3D stylization (train_style.py). Defaults mirror train.sh.
+  train-style:
+    <<: *base
+    entrypoint: ["bash", "/workspace/docker/train_style.sh"]
+    command: []
+    ports:
+      - "6431:6431"
+    environment:
+      <<: *base-env
+      # --- paths (resolved from .env) ---
+      SOURCE_PATH: /data/${SCENE:?set SCENE in .env}
+      GS_MODEL_PATH: /gs_output/${SCENE}
+      GS_CHECKPOINT_ITERATION: *gs-iterations
+      STYLE_IMAGE_PATH: /styles/${STYLE_IMAGE:?set STYLE_IMAGE in .env}
+      MODEL_PATH: /style_output/${SCENE}/${EXP_NAME:?set EXP_NAME in .env}
+      # --- Stable Diffusion ---
+      # Local diffusers directory prepared by download-sd. (A Hugging Face repo id
+      # does not work: the bundled pipeline_utils.py fails when downloading.)
+      SD_MODEL_KEY: *sd-local-dir
+      HEIGHT: "512"
+      WIDTH: "512"
+      FP16: "false"
+      # --- optimization ---
+      ITERATIONS: "600"
+      MAX_ITERATION: "600"
+      RESOLUTION: "1"
+      FEATURE_LR: "0.02"
+      # Views per step. train.sh uses 4, but that exceeds 24GB VRAM (RTX 4090) and
+      # spills into shared memory, becoming ~100x slower. 2 uses ~17GB.
+      BATCH_SIZE: "2"
+      # --- attention-aware loss ---
+      START_LAYER: "0"
+      END_LAYER: "16"
+      CONTENT_WEIGHT: "0.1"
+      SET_TIMESTEP: "0"
+      ADD_NOISE: "false"
+      # --- geometry-aware mask / reset ---
+      # train.sh uses 0, but a brightness reset at iteration 1 crashes (Adam has no state
+      # before its first step: scene/gaussian_model.py replace_tensor_to_optimizer).
+      # Resets run while START_RESET_ITER < iteration < END_RESET_ITER.
+      START_RESET_ITER: "1"
+      END_RESET_ITER: "300"
+      THRESH: "0.85"
+      LGT_THRESH: "0.9"
+      RESET_RATE: "0.8"
+      VIEWER_PORT: "6431"
+
+  # Optional: TensorBoard over both 3DGS and stylization logs.
+  tensorboard:
+    <<: *base
+    deploy: {}
+    entrypoint: ["tensorboard", "--logdir_spec", "3dgs:/gs_output,style:/style_output", "--bind_all", "--port", "6006"]
+    command: []
+    ports:
+      - "6006:6006"
+    environment:
+      <<: *base-env

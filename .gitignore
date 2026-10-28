@@ -1,0 +1,7 @@
+.env
+data/
+output/
+cache/
+models/
+__pycache__/
+style_image/*
