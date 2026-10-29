@@ -6,6 +6,7 @@
 #   docker compose run --rm prepare-scene # (if view sizes differ) RAW_SCENE -> SCENE
 #   docker compose run --rm train-3dgs    # 1. reconstruct the scene with 3DGS
 #   docker compose run --rm train-style   # 2. stylize it with DiffStyle3D
+#   docker compose run --rm render-orbit  # 3. render an orbit video of the result
 #   docker compose up tensorboard         # (optional) http://localhost:6006
 #
 # Paths and private values live in .env; every training config lives here and is
@@ -128,8 +129,8 @@ services:
       WIDTH: "512"
       FP16: "false"
       # --- optimization ---
-      ITERATIONS: "600"
-      MAX_ITERATION: "600"
+      ITERATIONS: "3000"
+      MAX_ITERATION: "3000"
       RESOLUTION: "1"
       FEATURE_LR: "0.02"
       # Views per step. train.sh uses 4, but that exceeds 24GB VRAM (RTX 4090) and
@@ -151,6 +152,25 @@ services:
       LGT_THRESH: "0.9"
       RESET_RATE: "0.8"
       VIEWER_PORT: "6431"
+
+  # Step 3: orbit video around the subject (docker/render_orbit.py), written to
+  # <ORBIT_MODEL_PATH>/orbit/iteration_<N>/orbit.mp4. Override with -e, e.g.
+  # `docker compose run --rm -e ORBIT_MODEL_PATH=/gs_output/<SCENE> render-orbit` for the photoreal 3DGS.
+  render-orbit:
+    <<: *base
+    entrypoint: ["bash", "/workspace/docker/render_orbit.sh"]
+    command: []
+    environment:
+      <<: *base-env
+      ORBIT_MODEL_PATH: /style_output/${SCENE:?set SCENE in .env}/${EXP_NAME:?set EXP_NAME in .env}
+      ORBIT_ITERATION: "-1"   # -1: latest point_cloud/iteration_*
+      SH_DEGREE: "3"
+      N_FRAMES: "120"         # frames for one sweep across the training cameras' azimuth range
+      FPS: "30"
+      SPAN_SCALE: "1.0"       # sweep range relative to that azimuth range (>1 shows unseen sides)
+      PINGPONG: "true"        # sweep there and back so the video loops
+      CENTER: gaussians       # orbit target: "gaussians" (head center) or "cameras" (where the cameras look)
+      MAX_SCALE: "0.5"        # hide Gaussians larger than this (streaks seen from novel views); scene units, "0" keeps all
 
   # Optional: TensorBoard over both 3DGS and stylization logs.
   tensorboard:

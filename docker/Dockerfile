@@ -52,6 +52,11 @@ RUN python -m pip install --no-build-isolation \
         /opt/gaussian-splatting/submodules/simple-knn \
         /opt/gaussian-splatting/submodules/fused-ssim
 
+# ffmpeg: encodes the render-orbit frames to H.264 (OpenCV's bundled FFmpeg has no H.264 encoder).
+# Installed after the CUDA extensions so adding it does not rebuild them.
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 # The project is also bind-mounted over /workspace by docker-compose.yml so that
 # local edits take effect without a rebuild; the copy keeps the image usable alone.
 WORKDIR /workspace
